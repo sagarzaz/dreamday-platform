@@ -1,0 +1,501 @@
+// Dream Day Coordinators – Smart Event Logistics Platform
+// Production-grade Prisma schema (PostgreSQL).
+//
+// Domain-driven naming:
+// - Avoids generic names (e.g., "User", "Hall", "Booking") by using explicit bounded-context language.
+// - Models are named after business concepts and responsibilities, not technical artifacts.
+//
+// Data integrity posture:
+// - Enforces referential integrity with explicit foreign keys and conservative onDelete behaviors.
+// - Uses composite uniqueness where the business demands exclusivity (double-booking prevention).
+// - Uses a transition-rule table + immutable status ledger to make illegal status changes mechanically harder
+//   and auditable. (A DB trigger is still recommended to fully prevent direct illegal updates to the
+//   current status column; see `EventBooking` notes.)
+//
+// Soft delete strategy:
+// - Applied ONLY where it doesn't conflict with financial/audit requirements or with hard uniqueness
+//   constraints. Notably, `EventBooking` is NOT soft-deleted because its uniqueness constraint must remain
+//   authoritative for all time (per requirements).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // Prisma ORM v7+ no longer allows specifying `url` inside `schema.prisma`.
+  // Connection URLs are defined in `prisma.config.ts` (see project root).
+}
+
+/// Platform-level access roles for Dream Day Coordinators.
+/// These are intentionally coarse-grained and reflect real operational responsibilities.
+/// Fine-grained permissions (if needed) should be implemented as policy tables, not as ad-hoc booleans.
+enum PlatformAccessRole {
+  /// Global root for platform operations: tenant provisioning, incident response, and emergency actions.
+  PLATFORM_SUPERADMIN
+
+  /// Internal staff who can manage listings, moderate, and support users.
+  PLATFORM_OPERATOR
+
+  /// A coordinator who operationally manages event logistics and bookings.
+  EVENT_COORDINATOR
+
+  /// A vendor-side operator responsible for their services and fulfillment.
+  VENDOR_OPERATOR
+
+  /// A venue-side operator responsible for their halls and availability.
+  VENUE_OPERATOR
+
+  /// A paying end-customer who books halls/services.
+  CUSTOMER_CLIENT
+}
+
+/// Account lifecycle states for a platform principal.
+/// Each value corresponds to a state that changes authentication/authorization behavior.
+enum PlatformAccountStatus {
+  /// Created but not yet verified (e.g., email not confirmed).
+  PENDING_VERIFICATION
+
+  /// Verified and allowed to authenticate and transact.
+  ACTIVE
+
+  /// Temporarily disabled by support/admin (e.g., policy violation); retains data for audit.
+  SUSPENDED
+
+  /// Automatically locked due to security events (e.g., repeated failed logins).
+  LOCKED
+
+  /// Deactivated intentionally (user requested) or by platform; cannot authenticate.
+  DEPROVISIONED
+}
+
+/// Vendor service categories supported by the platform.
+/// Categories are business-facing and drive discovery, filtering, and pricing expectations.
+enum VendorServiceCategory {
+  CATERING
+  DECOR
+  PHOTOGRAPHY
+  VIDEOGRAPHY
+  DJ_SOUND
+  LIGHTING
+  MAKEUP_ARTISTRY
+  TRANSPORT
+  SECURITY
+  MC_HOSTING
+  WEDDING_CAKE
+  FLORIST
+}
+
+/// Booking state machine for an event reservation.
+/// These values represent externally meaningful milestones (not internal implementation steps).
+///
+/// NOTE: Preventing illegal transitions requires state-machine enforcement.
+/// This schema includes:
+/// - `EventBookingStatusTransitionRule`: allowed transitions (seeded, immutable).
+/// - `EventBookingStatusChange`: append-only ledger referencing allowed transitions via FK.
+/// To fully prevent direct illegal updates to `EventBooking.bookingStatus`, add a DB trigger that:
+/// - rejects updates to `bookingStatus` unless a corresponding ledger row is inserted, and
+/// - validates ledger.fromStatus == prior bookingStatus.
+enum EventBookingStatus {
+  /// Customer started a booking intent but has not submitted it for processing.
+  DRAFT
+
+  /// Booking request has been submitted and awaits coordinator/vendor/venue acknowledgement.
+  SUBMITTED
+
+  /// The hall/date is temporarily held to prevent contention while payment/confirmation proceeds.
+  HOLD_PLACED
+
+  /// Awaiting payment initiation or completion (e.g., invoice created / payment link issued).
+  PAYMENT_PENDING
+
+  /// Payment partially received; booking still not fully settled.
+  PARTIALLY_PAID
+
+  /// Booking fully confirmed and financially settled (or marked as settled through allowed methods).
+  CONFIRMED
+
+  /// Event date has passed and operational completion is recorded.
+  COMPLETED
+
+  /// Booking expired (hold timed out / payment window elapsed) and is no longer actionable.
+  EXPIRED
+
+  /// Customer cancelled prior to event per policy.
+  CANCELLED_BY_CUSTOMER
+
+  /// Platform/operator cancelled (e.g., venue unavailable, fraud, policy).
+  CANCELLED_BY_PLATFORM
+}
+
+/// Payment processing state machine.
+/// Designed to map to common payment gateway semantics while remaining business-auditable.
+enum PaymentTransactionStatus {
+  /// Transaction record created locally (idempotency key reserved), not yet sent to provider.
+  INITIATED
+
+  /// Provider acknowledged and authorized the payment method, but not captured/settled yet.
+  AUTHORIZED
+
+  /// Funds capture performed successfully.
+  CAPTURED
+
+  /// Funds settled (finalized) in the financial system.
+  SETTLED
+
+  /// Provider declined or processing failed.
+  FAILED
+
+  /// Provider voided the payment before settlement.
+  VOIDED
+
+  /// Funds refunded fully after capture/settlement.
+  REFUNDED
+
+  /// Funds refunded partially after capture/settlement.
+  PARTIALLY_REFUNDED
+
+  /// Chargeback/dispute raised by payer.
+  CHARGEBACK
+}
+
+/// Supported payment methods.
+/// Expand conservatively because each method changes reconciliation/audit requirements.
+enum PaymentMethodType {
+  CARD
+  BANK_TRANSFER
+  CASH
+  WALLET
+  UPI
+  CHEQUE
+  MOBILE_MONEY
+}
+
+/// Entity kinds that can be audited.
+/// Explicit enum prevents free-form strings and makes audit queries strongly typed.
+enum AuditEntityType {
+  PLATFORM_USER
+  EVENT_HALL
+  VENDOR_SERVICE
+  EVENT_BOOKING
+  PAYMENT_TRANSACTION
+}
+
+/// Audited actions.
+/// Each action corresponds to a meaningful security or business-relevant event.
+enum AuditActionType {
+  CREATED
+  UPDATED
+  SOFT_DELETED
+  RESTORED
+  STATUS_CHANGED
+  PAYMENT_RECORDED
+  LOGIN_SUCCEEDED
+  LOGIN_FAILED
+  PASSWORD_RESET_REQUESTED
+  PASSWORD_CHANGED
+}
+
+/// Platform principal who can authenticate and perform actions.
+/// Named `PlatformUser` (not generic `User`) to reflect that this is a platform-wide identity.
+model PlatformUser {
+  /// UUID primary key for stable cross-system referencing and audit correlation.
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Human-readable name used in UIs, invoices, and audit trails.
+  fullName String @db.VarChar(200)
+
+  /// Login identifier.
+  ///
+  /// Production note:
+  /// - For truly case-insensitive uniqueness in PostgreSQL, use CITEXT. Prisma supports `@db.Citext`,
+  ///   but requires enabling the `citext` extension via migration. If you do not enable it, keep this as
+  ///   `VarChar` and store a normalized variant separately.
+  email String @unique @db.VarChar(320)
+
+  /// Argon2id/bcrypt hash (never store plaintext).
+  passwordHash String @db.VarChar(255)
+
+  /// Platform access role used for coarse-grained authorization.
+  role PlatformAccessRole
+
+  /// Account lifecycle used to gate authentication and access.
+  accountStatus PlatformAccountStatus @default(PENDING_VERIFICATION)
+
+  /// Creation timestamp for operational analytics and audit correlation.
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  /// Updated timestamp used for support workflows and security reviews.
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  /// Soft delete:
+  /// - We retain identity records for audit and referential integrity.
+  /// - Authentication should treat non-null `deletedAt` as deprovisioned.
+  deletedAt DateTime? @db.Timestamptz(6)
+
+  /// Reverse relations
+  customerBookings EventBooking[] @relation("EventBookingCustomer")
+  bookingStatusChanges EventBookingStatusChange[] @relation("BookingStatusChangedBy")
+  auditEvents AuditTrail[] @relation("AuditPerformedBy")
+
+  @@index([accountStatus, role], map: "idx_platform_user_status_role")
+  @@index([deletedAt], map: "idx_platform_user_deleted_at")
+}
+
+/// A physical event venue/hall listing.
+/// Named `EventHall` (not generic `Hall`) because it's a specific booking target in this domain.
+model EventHall {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Public listing name.
+  hallName String @db.VarChar(200)
+
+  /// District is a critical search dimension; stored as a string because districts vary by region/country.
+  district String @db.VarChar(120)
+
+  /// Max guests supported; used for eligibility filtering and capacity pricing.
+  capacity Int
+
+  /// Baseline pricing for the hall; financial values use Decimal to avoid float rounding.
+  basePrice Decimal @db.Decimal(12, 2)
+
+  /// Geolocation stored as fixed-precision decimals for indexing and deterministic comparisons.
+  latitude Decimal @db.Decimal(9, 6)
+  longitude Decimal @db.Decimal(9, 6)
+
+  /// Operational switch for temporarily pausing the listing without deleting it.
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  /// Soft delete:
+  /// - Required because halls may be retired but must remain referenced by historical bookings.
+  deletedAt DateTime? @db.Timestamptz(6)
+
+  /// Reverse relations
+  bookings EventBooking[]
+
+  /// Indexing strategy:
+  /// - Composite index supports the common search query: "halls in district with capacity >= X".
+  ///   Postgres can use this index to quickly narrow district candidates then filter capacity.
+  @@index([district, capacity], map: "idx_event_hall_district_capacity")
+  @@index([isActive, deletedAt], map: "idx_event_hall_active_not_deleted")
+}
+
+/// A vendor-offered service available for events (e.g., catering, decor).
+/// Named `VendorService` (not generic `Service`) to anchor it in the marketplace context.
+model VendorService {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Vendor brand name as presented to customers.
+  vendorName String @db.VarChar(200)
+
+  /// Service category drives search UX, SLA expectations, and operational routing.
+  category VendorServiceCategory
+
+  /// Primary district served by this vendor service; used for matching.
+  serviceDistrict String @db.VarChar(120)
+
+  /// Marketplace rating; Decimal keeps deterministic sorting and avoids float drift.
+  /// (Range enforcement (0..5) should be applied via DB CHECK in a migration or at application layer.)
+  rating Decimal @default(0) @db.Decimal(3, 2)
+
+  /// Verification is a trust signal; used for ranking and eligibility.
+  isVerified Boolean @default(false)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  /// Soft delete:
+  /// - Keeps vendor history and prevents orphaned references in audits/financial records.
+  deletedAt DateTime? @db.Timestamptz(6)
+
+  @@index([category, serviceDistrict], map: "idx_vendor_service_category_district")
+  @@index([isVerified, rating], map: "idx_vendor_service_verified_rating")
+  @@index([deletedAt], map: "idx_vendor_service_deleted_at")
+}
+
+/// A reservation of an `EventHall` on a specific date by a customer.
+/// Named `EventBooking` (not generic `Booking`) to reflect event-specific semantics and constraints.
+model EventBooking {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Foreign key to the reserved hall.
+  eventHallId String @db.Uuid
+  eventHall EventHall @relation(fields: [eventHallId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// Foreign key to the customer principal.
+  customerId String @db.Uuid
+  customer PlatformUser @relation("EventBookingCustomer", fields: [customerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// The booked event date.
+  ///
+  /// IMPORTANT:
+  /// - Prisma doesn't have a dedicated "date-only" scalar; we use DateTime.
+  /// - For the composite uniqueness to behave as "one booking per hall per calendar date",
+  ///   the application MUST canonicalize this to a consistent instant (e.g., midnight UTC or the venue's
+  ///   local date expressed as midnight in a fixed timezone).
+  eventDate DateTime @db.Timestamptz(6)
+
+  /// Declared guest count used for capacity validation and pricing.
+  guestCount Int
+
+  /// Total amount agreed for the booking (not necessarily the amount paid yet).
+  totalAmount Decimal @db.Decimal(12, 2)
+
+  /// Current booking status used for query performance.
+  ///
+  /// Data integrity note:
+  /// - The authoritative transition log is `EventBookingStatusChange` (append-only).
+  /// - To ensure `bookingStatus` cannot be moved illegally, add a DB trigger:
+  ///   - validate the status transition is allowed,
+  ///   - require a corresponding ledger row, and
+  ///   - ensure ledger.fromStatus equals the previous `bookingStatus`.
+  bookingStatus EventBookingStatus @default(DRAFT)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  /// Reverse relations
+  paymentTransactions PaymentTransaction[]
+  statusLedger EventBookingStatusChange[]
+
+  /// Composite uniqueness requirement:
+  /// - Prevents double booking of the same hall on the same eventDate at the database level.
+  /// - This is a hard invariant and must not be bypassed by application bugs or race conditions.
+  @@unique([eventHallId, eventDate], map: "uq_event_booking_hall_date")
+
+  /// Indexing strategy:
+  /// - Directly supports back-office workflows (filter by status).
+  /// - Supports calendar views and customer histories.
+  @@index([bookingStatus], map: "idx_event_booking_status")
+  @@index([eventDate], map: "idx_event_booking_event_date")
+  @@index([customerId, createdAt], map: "idx_event_booking_customer_created")
+}
+
+/// A single payment attempt/record associated with an `EventBooking`.
+/// Named `PaymentTransaction` (not generic `Payment`) because reconciliation requires transaction-level detail.
+model PaymentTransaction {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Foreign key to the booking this payment relates to.
+  bookingId String @db.Uuid
+  booking EventBooking @relation(fields: [bookingId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// Current processing status of this transaction.
+  paymentStatus PaymentTransactionStatus @default(INITIATED)
+
+  /// Payment method used/selected.
+  paymentMethod PaymentMethodType
+
+  /// Amount attempted/charged in this transaction.
+  amount Decimal @db.Decimal(12, 2)
+
+  /// ISO currency code (e.g., "INR", "USD").
+  currencyCode String @db.Char(3)
+
+  /// Idempotency key ensures retries do not create duplicate charges.
+  /// This must be unique globally per payment provider integration boundary.
+  idempotencyKey String @unique @db.VarChar(120)
+
+  /// External gateway/provider reference for reconciliation.
+  gatewayReference String? @db.VarChar(120)
+
+  /// When the transaction is considered paid/settled from a business perspective.
+  paidAt DateTime? @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([bookingId, createdAt], map: "idx_payment_txn_booking_created")
+  @@index([paymentStatus, createdAt], map: "idx_payment_txn_status_created")
+}
+
+/// Allowed transitions for the `EventBookingStatus` state machine.
+/// This table is intended to be seeded and treated as immutable configuration.
+///
+/// Why this exists (production design decision):
+/// - Enums alone define *possible states*, not *legal transitions*.
+/// - By modeling transitions as data and referencing them from the status ledger,
+///   the database can enforce that every recorded transition is legal via a foreign key.
+model EventBookingStatusTransitionRule {
+  id String @id @default(uuid()) @db.Uuid
+
+  fromStatus EventBookingStatus
+  toStatus EventBookingStatus
+
+  /// Operational description to aid internal tooling and audits.
+  ruleDescription String? @db.VarChar(400)
+
+  /// Reverse relation:
+  /// - Required by Prisma for relation completeness.
+  /// - Semantically, this represents "all status-change ledger entries that used this allowed transition".
+  statusChanges EventBookingStatusChange[] @relation("BookingStatusTransitionRuleUsage")
+
+  /// A transition pair must be unique to serve as a stable FK target.
+  @@unique([fromStatus, toStatus], map: "uq_booking_status_transition_pair")
+}
+
+/// Append-only ledger of status changes for an `EventBooking`.
+/// This is the audit-grade history used for investigations, dispute resolution, and analytics.
+model EventBookingStatusChange {
+  id String @id @default(uuid()) @db.Uuid
+
+  eventBookingId String @db.Uuid
+  eventBooking EventBooking @relation(fields: [eventBookingId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// The previous status claimed by the transition event.
+  fromStatus EventBookingStatus
+
+  /// The next status claimed by the transition event.
+  toStatus EventBookingStatus
+
+  /// Enforces that (fromStatus -> toStatus) is a legal transition by FK to the transition rules table.
+  transitionRule EventBookingStatusTransitionRule @relation("BookingStatusTransitionRuleUsage", fields: [fromStatus, toStatus], references: [fromStatus, toStatus], onDelete: Restrict, onUpdate: Cascade)
+
+  /// Who performed the transition. Optional to allow system-driven transitions (e.g., EXPIRED).
+  changedByUserId String? @db.Uuid
+  changedBy PlatformUser? @relation("BookingStatusChangedBy", fields: [changedByUserId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  /// When the status transition was recorded.
+  changedAt DateTime @default(now()) @db.Timestamptz(6)
+
+  /// Additional context for customer support and audits (e.g., "payment_timeout", "venue_unavailable").
+  changeContext Json?
+
+  @@index([eventBookingId, changedAt], map: "idx_booking_status_change_booking_time")
+  @@index([toStatus, changedAt], map: "idx_booking_status_change_to_status_time")
+}
+
+/// Audit trail for security/business-critical actions.
+/// Named `AuditTrail` (not generic `Log`) to emphasize compliance-grade intent and query patterns.
+model AuditTrail {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Entity kind is strongly typed so consumers can build reliable filters and dashboards.
+  entityType AuditEntityType
+
+  /// The UUID of the entity instance. Stored as UUID to preserve type safety and index efficiency.
+  entityId String @db.Uuid
+
+  /// Action performed on the entity.
+  actionType AuditActionType
+
+  /// Actor principal. Optional for system actions and automated jobs.
+  performedByUserId String? @db.Uuid
+  performedBy PlatformUser? @relation("AuditPerformedBy", fields: [performedByUserId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  /// Timestamp of the action event.
+  timestamp DateTime @default(now()) @db.Timestamptz(6)
+
+  /// Optional structured payload (diff summary, request metadata, correlation IDs).
+  metadata Json?
+
+  /// Indexing strategy:
+  /// - `entityType + entityId + timestamp` supports fast entity timeline queries.
+  /// - `performedByUserId + timestamp` supports actor investigations.
+  @@index([entityType, entityId, timestamp], map: "idx_audit_entity_timeline")
+  @@index([performedByUserId, timestamp], map: "idx_audit_actor_timeline")
+}
+
