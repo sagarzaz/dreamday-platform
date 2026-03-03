@@ -1,0 +1,324 @@
+openapi: 3.0.3
+info:
+  title: DreamDay API
+  version: "1.0.0"
+  description: |
+    DreamDay Platform — serverless API (Next.js App Router). All endpoints are
+    versioned under /api/v1. Responses use a standard envelope: { success, data | error }.
+
+servers:
+  - url: https://api.example.com
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    SuccessEnvelope:
+      type: object
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          type: object
+      required: [success, data]
+
+    ErrorEnvelope:
+      type: object
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+      required: [success, error]
+
+    LoginRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+      required: [email, password]
+
+    TokenPair:
+      type: object
+      properties:
+        accessToken:
+          type: string
+        refreshToken:
+          type: string
+        expiresIn:
+          type: string
+
+    UserSummary:
+      type: object
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+        role:
+          type: string
+
+    BookingInput:
+      type: object
+      properties:
+        eventHallId:
+          type: string
+        eventDate:
+          type: string
+          format: date-time
+        guestCount:
+          type: integer
+        totalAmount:
+          type: number
+      required: [eventHallId, eventDate, guestCount, totalAmount]
+
+    Booking:
+      type: object
+      properties:
+        id:
+          type: string
+        eventHallId:
+          type: string
+        eventDate:
+          type: string
+          format: date-time
+        guestCount:
+          type: integer
+        totalAmount:
+          type: number
+        customerId:
+          type: string
+        bookingStatus:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+
+    Hall:
+      type: object
+      properties:
+        id:
+          type: string
+        hallName:
+          type: string
+        district:
+          type: string
+        capacity:
+          type: integer
+        basePrice:
+          type: number
+
+    ErrorCodes:
+      type: string
+      enum:
+        - UNAUTHORIZED
+        - FORBIDDEN
+        - INVALID_CREDENTIALS
+        - ACCOUNT_LOCKED
+        - TOKEN_EXPIRED
+        - TOKEN_INVALID
+        - VALIDATION_FAILED
+        - HALL_NOT_FOUND
+        - CAPACITY_EXCEEDED
+        - BOOKING_CONFLICT
+        - INTERNAL_ERROR
+
+paths:
+  /api/v1/auth/login:
+    post:
+      summary: Login and obtain access & refresh tokens
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          user:
+                            $ref: "#/components/schemas/UserSummary"
+                          tokens:
+                            $ref: "#/components/schemas/TokenPair"
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+      description: |
+        Rate limiting applies to login routes (per IP). Configure via environment.
+
+  /api/v1/auth/refresh:
+    post:
+      summary: Exchange refresh token for new access token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refreshToken:
+                  type: string
+              required: [refreshToken]
+      responses:
+        "200":
+          description: Tokens refreshed
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          tokens:
+                            $ref: "#/components/schemas/TokenPair"
+        "401":
+          description: Refresh token invalid or revoked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /api/v1/bookings:
+    post:
+      security:
+        - bearerAuth: []
+      summary: Create a booking (customer authenticated)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BookingInput"
+      responses:
+        "200":
+          description: Booking created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/Booking"
+        "409":
+          description: Booking conflict — hall already booked for date
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "422":
+          description: Validation failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+      description: |
+        This endpoint requires JWT bearer authentication. Rate limiting applies per-user.
+
+  /api/v1/halls:
+    get:
+      summary: List halls
+      responses:
+        "200":
+          description: List of halls
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/Hall"
+
+  /api/v1/halls/{id}:
+    get:
+      summary: Get a hall by ID
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Hall details
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/Hall"
+        "404":
+          description: Hall not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /api/v1/health:
+    get:
+      summary: Liveness probe
+      responses:
+        "200":
+          description: Service alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  timestamp:
+                    type: string
+
+  /api/v1/ready:
+    get:
+      summary: Readiness probe (DB connectivity)
+      responses:
+        "200":
+          description: Ready
+        "503":
+          description: Not ready (DB unavailable)
+
+tags:
+  - name: auth
+  - name: bookings
+  - name: halls
