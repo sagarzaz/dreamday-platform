@@ -1,37 +1,99 @@
 # DreamDay Platform — Smart Event Logistics System
 
-Production-grade backend: concurrency-safe booking (DB unique constraint + audit), Redis caching, JWT auth, WebSocket notifications, versioned API, rate limiting, and structured errors.
+A production-grade, serverless fullstack foundation for a smart event hall booking and logistics platform.
 
-## Backend (Next.js 14 App Router Serverless + Prisma)
+This project is designed to demonstrate real-world backend engineering discipline, including:
 
-### Prerequisites
-- Node.js 18+
-- PostgreSQL
-- Redis (optional; used for hall cache and refresh token store)
+- Concurrency-safe booking (DB-level unique constraints)
+- Distributed Redis rate limiting
+- JWT authentication with refresh-token revocation
+- Serverless Next.js App Router architecture
+- Structured error handling
+- Centralized configuration & fail-fast validation
+- Production documentation and OpenAPI specification
 
-### Environment
-Create `.env` (see `.env.example` if present). Required:
-- `DATABASE_URL` — PostgreSQL connection string (used via `prisma.config.ts` in Prisma 7)
-- `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET` — strong random secrets
-- `REDIS_URL` — optional; if missing, hall cache is disabled and refresh tokens use in-memory store
+> Current status: **Backend v1.0.0 — Locked & Production-Ready**
+> Frontend integration in progress.
 
-### Commands
-```bash
-npm install
-npx prisma generate
-npm run dev          # ts-node-dev
-npm run build && npm start
-npm test
-```
+---
 
-### API
-- `POST /api/v1/auth/login` — login (rate limited by IP)
-- `POST /api/v1/auth/refresh` — refresh tokens
-- `POST /api/v1/bookings` — create booking (auth + role CUSTOMER_CLIENT or admin)
-- `GET /api/v1/halls?district=&minCapacity=&maxBudget=&limit=&offset=` — list halls (optional cache)
-- `GET /api/v1/halls/:id` — get hall by id
+## 🏗 Architecture Overview
 
-### Docs
-- `docs/backend-architecture.md` — system overview, data flow, scaling
-- `docs/ARCHITECTURAL-REVIEW.md` — tradeoffs, bottlenecks, security, hardening
-- `prisma/INDEXING.md` — index and constraint rationale
+### Backend Stack
+
+- **Next.js 14 App Router (Serverless Route Handlers)**
+- **Prisma ORM**
+- **PostgreSQL (Neon-compatible)**
+- **Upstash Redis (distributed rate limiting + token revocation)**
+- **Custom JWT authentication**
+- **Strict TypeScript**
+
+### Design Principles
+
+- No in-memory state (fully serverless-safe)
+- Database-enforced concurrency
+- Distributed rate limiting
+- Standardized API response envelope
+- Fail-fast environment validation
+- Structured JSON logging with PII redaction
+- Clear migration path to dedicated Node backend if needed
+
+---
+
+## 🔐 Core Engineering Features
+
+### 1️⃣ Concurrency-Safe Booking
+
+- Composite unique constraint on `(eventHallId, eventDate)`
+- Prisma transaction enforcement
+- Graceful conflict handling (409)
+- Audit-friendly error mapping
+
+Prevents double-booking even under concurrent requests.
+
+---
+
+### 2️⃣ Distributed Rate Limiting
+
+- Upstash Redis sliding-window strategy
+- IP-based login throttling
+- User-based booking throttling
+- Configurable via environment variables
+- No in-memory limits (horizontal scaling safe)
+
+---
+
+### 3️⃣ JWT Authentication (Access + Refresh)
+
+- Access token verification
+- Refresh token with Redis revocation store
+- Role-based authorization
+- No token data leakage
+- Strict expiration validation
+
+---
+
+### 4️⃣ Serverless Architecture
+
+- Pure Next.js route handlers (`/app/api/v1/*`)
+- No Express
+- Stateless design
+- Prisma singleton pattern
+- Redis singleton pattern
+- Compatible with Vercel deployment
+
+---
+
+### 5️⃣ Standardized API Responses
+
+All responses follow:
+
+```json
+{
+  "success": true | false,
+  "data": {},
+  "error": {
+    "code": "ERROR_CODE",
+    "message": "Human readable message"
+  }
+}
